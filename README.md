@@ -2,8 +2,6 @@
 
 A real-time travel planning system built with **6 specialized AI agents** orchestrated via **LangGraph**, powered by **Groq LLaMA 3.3 70B** and **SerpAPI Google Flights**. The system uses parallel execution to query multiple flight search perspectives simultaneously, aggregates and ranks results, and returns a natural-language response to the user.
 
-**Repository**: [https://github.com/suvraadeep/Flight-Agent.git](https://github.com/suvraadeep/Flight-Agent.git)
-
 ---
 
 ## Architecture Overview
