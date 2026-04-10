@@ -23,6 +23,10 @@ class TravelState(TypedDict):
     fastest_flight:        Optional[Dict]
     all_flights_ranked:    Optional[List[Dict]]
     price_insights:        Optional[Dict]
+    connecting_flight_results: Optional[List[Dict]]
+    alt_transport_results:     Optional[List[Dict]]
+    hybrid_itinerary:          Optional[List[Dict]]
+    search_mode:               Optional[str]
     final_response:        Optional[str]
     execution_trace:       Annotated[List[Dict], operator.add]
 
@@ -42,5 +46,9 @@ def make_state(user_input: str, history: List = None) -> TravelState:
         best_flight=None,          cheapest_flight=None,
         fastest_flight=None,       all_flights_ranked=None,
         price_insights=None,
+        connecting_flight_results=None,
+        alt_transport_results=None,
+        hybrid_itinerary=None,
+        search_mode=None,
         final_response=None,       execution_trace=[],
     )

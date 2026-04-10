@@ -17,7 +17,8 @@ app     = build_app()
 BANNER = """
 ╔═══════════════════════════════════════════════════════════════╗
 ║   ✈️   REAL-TIME TRAVEL AGENT  —  CLI Chatbot                 ║
-║   6 Agents · LangGraph · Groq LLaMA · SerpAPI Flights        ║
+║   8 Agents · LangGraph · Groq LLaMA · SerpAPI                ║
+║   Direct + Connecting Flights · Trains · Buses               ║
 ╠═══════════════════════════════════════════════════════════════╣
 ║  /quit  /clear  /history  /trace  /help  /lite  /status      ║
 ╚═══════════════════════════════════════════════════════════════╝
