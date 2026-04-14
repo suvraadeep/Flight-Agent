@@ -1,6 +1,6 @@
 # Flight-Agent
 
-A real-time travel planning system built with **6 specialized AI agents** orchestrated via **LangGraph**, powered by **Groq LLaMA 3.3 70B** and **SerpAPI Google Flights**. The system uses parallel execution to query multiple flight search perspectives simultaneously, aggregates and ranks results, and returns a natural-language response to the user.
+A real-time travel planning system built with **8 specialized AI agents** orchestrated via **LangGraph**, powered by **Groq LLaMA 3.3 70B** and **SerpAPI Google Flights**. The system uses parallel execution to query multiple flight search perspectives simultaneously, features a **3-tier cascading fallback** (direct flights → connecting flights → hybrid flight+ground transport), aggregates and ranks results, and returns a natural-language response to the user.
 
 ---
 
@@ -10,24 +10,25 @@ A real-time travel planning system built with **6 specialized AI agents** orches
   <img src="images/arch.jpeg" alt="Architecture Diagram" width="700"/>
 </p>
 
-The pipeline is a **directed acyclic graph (DAG)** compiled by LangGraph's `StateGraph`. Each node in the graph is a single-responsibility agent that reads from and writes to a shared, immutable-by-convention `TravelState` context. The graph has two execution phases:
+The pipeline is a **directed acyclic graph (DAG)** compiled by LangGraph's `StateGraph`. Each node in the graph is a single-responsibility agent that reads from and writes to a shared, immutable-by-convention `TravelState` context. The graph has three execution phases:
 
 1. **Sequential phase**: `ParserAgent` > `AirportResolverAgent` > `ValidatorAgent` (each depends on the previous output)
-2. **Parallel phase**: `ParallelFlightSearchNode` launches 3 concurrent SerpAPI calls, followed by `AggregatorAgent` > `FormatterAgent`
+2. **Parallel search phase**: `ParallelFlightSearchNode` launches 3 concurrent SerpAPI calls
+3. **Cascading fallback phase**: If direct flights fail → `ConnectingFlightSearchNode` → if that fails → `AltTransportSearchNode` → `AggregatorAgent` > `FormatterAgent`
 
-A conditional edge after `ValidatorAgent` short-circuits directly to `FormatterAgent` when clarification is needed, skipping the expensive flight search entirely.
+A conditional edge after `ValidatorAgent` short-circuits directly to `FormatterAgent` when clarification is needed, skipping the expensive search entirely.
 
 ```
 START
   |
   v
-ParserAgent  (LLM: extract destination, dates, cabin, passengers)
+ParserAgent  (LLM: extract destination, dates, cabin, passengers, travel type)
   |
   v
 AirportResolverAgent  (2 parallel IATA lookups: origin + destination)
   |
   v
-ValidatorAgent  (rules-based: checks required fields, date validity)
+ValidatorAgent  (rules-based: checks required fields, date validity, travel type)
   |
   +--[needs clarification]--> FormatterAgent --> END
   |
@@ -36,17 +37,81 @@ ValidatorAgent  (rules-based: checks required fields, date validity)
   v
 ParallelFlightSearchNode  (3 SerpAPI calls in parallel: best, cheapest, fastest)
   |
-  v
-AggregatorAgent  (deduplicate, score, rank)
+  +--[direct flights found]--> AggregatorAgent
+  |
+  +--[no direct flights]
   |
   v
-FormatterAgent  (LLM: natural-language summary)
+ConnectingFlightSearchNode  (LLM hub discovery + 2-leg searches in parallel)
+  |
+  +--[connecting found]--> AggregatorAgent
+  |
+  +--[no connecting flights]
+  |
+  v
+AltTransportSearchNode  (nearest airport + ground transport + direct train/bus)
+  |
+  v
+AggregatorAgent  (deduplicate, score, rank across all search modes)
+  |
+  v
+FormatterAgent  (LLM: mode-specific natural-language summary)
   |
   v
 END
 ```
 
 ---
+
+## Recent Updates (v2)
+
+### 1. Connecting Flight Search via LLM-Discovered Hubs
+
+When no direct flights exist for a route, the system now automatically falls back to a **ConnectingFlightSearchNode**. This agent:
+
+- Uses the LLM as a **routing expert** to discover the best 3 hub airports for the given origin–destination pair (e.g. Guwahati, Kolkata for northeast India routes)
+- Searches **both legs** (origin→hub and hub→destination) in parallel using `ThreadPoolExecutor`
+- Combines leg results into ranked connecting itineraries, sorted by total price
+- Returns up to 8 connecting options with per-leg details (airline, price, duration)
+
+### 2. Hybrid Flight + Ground Transport Fallback
+
+If connecting flights also fail, the **AltTransportSearchNode** kicks in with a multi-step hybrid search:
+
+- **Nearest airport discovery**: LLM identifies the closest major airport to the remote destination
+- **Flight search**: Searches flights from origin to that nearest airport
+- **Ground transport search**: Uses SerpAPI Google Search to find trains/buses from the airport city to the final destination, then extracts structured options via LLM
+- **Direct train/bus fallback**: Also searches for direct ground transport as a pure fallback
+- Builds hybrid itineraries combining flight + ground legs with total cost estimates
+
+### 3. Three-Tier Cascading Orchestration
+
+The graph now uses **3 conditional edges** to implement a cascading fallback strategy:
+
+| Tier | Agent | Condition to Proceed |
+|------|-------|---------------------|
+| 1 | `ParallelFlightSearchNode` | Direct flights found → aggregate |
+| 2 | `ConnectingFlightSearchNode` | No direct flights → try connecting via hubs |
+| 3 | `AltTransportSearchNode` | No connecting flights either → hybrid + ground transport |
+
+Each tier is only executed if the previous tier yields zero results. This preserves SerpAPI quota while maximizing the chance of returning useful travel options.
+
+### 4. Multi-Travel-Type Validation
+
+The `ValidatorAgent` now supports **multiple travel types** (flight, hotel, train, cruise) with type-specific required field checks. Each travel type has its own validation rules defined in a `_REQUIRED` config dictionary.
+
+### 5. Enhanced Aggregator (4 Search Modes)
+
+The `AggregatorAgent` now handles 4 distinct search modes with dedicated aggregation logic:
+
+- **`direct`**: Original composite scoring (60% price + 40% duration) with deduplication
+- **`connecting`**: Ranks connecting itineraries by total price across both legs
+- **`hybrid`**: Processes flight + ground transport combinations
+- **`alt_transport`**: Passes through direct train/bus results
+
+### 6. Mode-Specific Formatter with LLM Prompts
+
+The `FormatterAgent` now uses **4 specialized system prompts**, each tailored to a different search mode (direct, connecting, hybrid, alt transport). Every mode has a fallback template in case the LLM call fails, ensuring the user always gets a response.
 
 ---
 
@@ -63,43 +128,49 @@ Flight-Agent/
 |   |-- iata.py           # LLM-first IATA resolution with DDG fallback
 |-- agents/
 |   |-- __init__.py
-|   |-- parser_agent.py   # LLM: free-text to structured JSON
-|   |-- airport_agent.py  # Parallel IATA code resolution
-|   |-- validator_agent.py# Rules-based field and date validation
-|   |-- flight_search_agent.py  # 3 parallel SerpAPI searches
-|   |-- aggregator_agent.py     # Dedup, score, rank
-|   |-- formatter_agent.py      # LLM: data to natural-language response
+|   |-- parser_agent.py           # LLM: free-text to structured JSON
+|   |-- airport_agent.py          # Parallel IATA code resolution
+|   |-- validator_agent.py        # Rules-based field and date validation
+|   |-- flight_search_agent.py    # 3 parallel SerpAPI searches
+|   |-- connecting_flight_agent.py # LLM hub discovery + 2-leg connecting flights 
+|   |-- alt_transport_agent.py    # Hybrid flight+ground & direct train/bus       
+|   |-- aggregator_agent.py       # Dedup, score, rank (4 search modes)
+|   |-- formatter_agent.py        # LLM: mode-specific natural-language response
 |-- graph/
 |   |-- __init__.py
-|   |-- orchestrator.py   # LangGraph DAG: wiring agents + conditional edges
-|-- main.py               # CLI chatbot with Rich UI
+|   |-- orchestrator.py   # LangGraph DAG: 3-tier cascading fallback
+|-- main.py               # CLI chatbot with Rich UI (8 agents)
 |-- requirements.txt
 ```
 
 ---
 
-## Why 6 Agents?
+## Why 8 Agents?
 
-The system uses exactly **6 agents**, each with a clear single responsibility. This number is deliberate: not 5; not 7.
+The system uses exactly **8 agents**, each with a clear single responsibility.
 
 | # | Agent | Type | Responsibility |
 |---|-------|------|----------------|
-| 1 | **ParserAgent** | LLM | Extract structured travel data (destination, origin, date, passengers, cabin class) from free-text user input |
+| 1 | **ParserAgent** | LLM | Extract structured travel data (destination, origin, date, passengers, cabin class, travel type) from free-text user input |
 | 2 | **AirportResolverAgent** | LLM + Web | Convert city names to IATA airport codes via LLM lookup with DuckDuckGo fallback |
-| 3 | **ValidatorAgent** | Rules-based | Validate required fields exist, check date is not in the past, determine if clarification is needed |
+| 3 | **ValidatorAgent** | Rules-based | Validate required fields by travel type, check date is not in the past, determine if clarification is needed |
 | 4 | **ParallelFlightSearchNode** | External API | Launch 3 concurrent SerpAPI Google Flights searches (sorted by best, cheapest, fastest) |
-| 5 | **AggregatorAgent** | Deterministic | Deduplicate flights across search perspectives, compute composite scores (60% price + 40% duration), rank results |
-| 6 | **FormatterAgent** | LLM | Generate a concise, user-friendly natural-language response from the ranked flight data |
+| 5 | **ConnectingFlightSearchNode** | LLM + External API | Discover hub airports via LLM, search both legs in parallel, build connecting itineraries |
+| 6 | **AltTransportSearchNode** | LLM + External API + Web | Find nearest airport, search flights + ground transport, build hybrid itineraries with train/bus |
+| 7 | **AggregatorAgent** | Deterministic | Deduplicate and rank results across 4 search modes (direct, connecting, hybrid, alt transport) |
+| 8 | **FormatterAgent** | LLM | Generate mode-specific natural-language responses with fallback templates |
 
 ### Why not fewer agents?
 
 **Parsing and validation are deliberately separate.** The ParserAgent uses an LLM to extract structured data from natural language, which is a fundamentally different operation from the ValidatorAgent's deterministic rules (checking for missing fields, validating dates). Combining them would mix probabilistic LLM behavior with strict business logic, making the system harder to debug and test. When the parser returns garbage JSON, the validator catches it cleanly and routes to clarification without wasting API calls on flight searches.
 
-**The AggregatorAgent exists because parallel search results need non-trivial merging.** Three independent searches return overlapping flights from different sort perspectives. Without deduplication and composite scoring, the user would see duplicate entries or miss the actual best deal. The aggregator normalizes prices and durations across all results and applies a weighted scoring formula. Embedding this logic in the search node or formatter would violate single responsibility and make the pipeline harder to extend.
+**The AggregatorAgent exists because search results from 4 different modes need non-trivial merging.** Direct flights, connecting flights, hybrid itineraries, and ground transport all have different data shapes. Without a dedicated aggregator, the formatter would need to handle all this logic, violating single responsibility.
+
+**The three search agents are deliberately separate.** Direct search, connecting search, and alt transport search have fundamentally different strategies (parallel SerpAPI calls vs. LLM hub discovery + 2-leg search vs. nearest-airport + ground transport lookup). Combining them would create a monolithic agent that's impossible to test or extend independently. The cascading fallback design means each search agent only runs when needed.
 
 ### Why not more agents?
 
-The AirportResolverAgent could theoretically be split into two (one per city), but they share the same resolution logic and cache. Running them as two `ThreadPoolExecutor` workers inside one agent gives us parallelism without the overhead of two separate graph nodes. Similarly, the 3 flight searches are logically one "search node" that internally parallelizes since they share identical input parameters and differ only in sort order.
+The AirportResolverAgent could theoretically be split into two (one per city), but they share the same resolution logic and cache. Running them as two `ThreadPoolExecutor` workers inside one agent gives us parallelism without the overhead of two separate graph nodes. Similarly, the 3 flight searches are logically one "search node" that internally parallelizes since they share identical input parameters and differ only in sort order. The `AltTransportSearchNode` combines nearest-airport discovery, flight search, and ground transport search into one agent because these steps are tightly coupled and sequential within the same fallback tier.
 
 ---
 
@@ -150,8 +221,14 @@ class TravelState(TypedDict):
     parsed_data:           Optional[Dict[str, Any]]
     origin_iata:           Optional[str]
     destination_iata:      Optional[str]
+    origin_display:        Optional[str]
+    destination_display:   Optional[str]
     needs_clarification:   bool
     flight_results:        Annotated[List[Dict], operator.add]  # append-only
+    connecting_flight_results: Optional[List[Dict]]             # connecting itineraries
+    alt_transport_results:     Optional[List[Dict]]             # direct train/bus
+    hybrid_itinerary:          Optional[List[Dict]]             # flight + ground combos
+    search_mode:               Optional[str]                    # direct|connecting|hybrid|alt_transport
     execution_trace:       Annotated[List[Dict], operator.add]  # append-only
     best_flight:           Optional[Dict]
     final_response:        Optional[str]
